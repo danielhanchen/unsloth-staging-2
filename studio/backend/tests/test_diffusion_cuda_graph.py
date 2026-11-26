@@ -2418,3 +2418,244 @@ def test_real_cuda_real_warmup_matches_eager_bit_for_bit(monkeypatch):
         assert module.runs == steps + cg.WARMUP_ITERS + 1
     finally:
         handle.disable()
+
+
+# ---------------------------------------------------------------- batched (coalesced) graph keys
+
+
+@side_stream
+def test_a_users_coalesced_call_never_records_a_batched_graph(stub_torch):
+    handle = _armed()
+    with cg.batch_rows(2):
+        handle(_t((2, 4)), timestep = _t((2,)), return_dict = False)
+    assert handle.stats["captures"] == 0
+    assert handle.stats["batch_eager"] == 1
+    assert handle.cache == {}
+
+
+@side_stream
+def test_a_race_records_batch_sizes_two_and_four_next_to_size_one(stub_torch):
+    handle = _armed()
+    handle(_t((1, 4)), timestep = _t((1,)), return_dict = False)
+    with cg.batch_rows(2, capture = True):
+        handle(_t((2, 4)), timestep = _t((2,)), return_dict = False)
+    with cg.batch_rows(3, capture = True):
+        handle(_t((3, 4)), timestep = _t((3,)), return_dict = False)
+    with cg.batch_rows(4, capture = True):
+        handle(_t((4, 4)), timestep = _t((4,)), return_dict = False)
+    assert handle.stats["captures"] == 3
+    assert handle.stats["batch_captures"] == 2
+    assert sorted(handle._batched.values()) == [2, 4]
+    assert handle.describe()["batched_graphs"] == [2, 4]
+    # A recorded batch size replays inside a user's call (no recording needed).
+    before = handle.stats["replays"]
+    with cg.batch_rows(2):
+        handle(_t((2, 4)), timestep = _t((2,)), return_dict = False)
+    assert handle.stats["replays"] == before + 1
+
+
+@side_stream
+def test_a_full_cache_never_evicts_a_size_one_graph_for_a_batch(stub_torch):
+    handle = cg.GraphedForward(_FakeDiT(), max_graphs = 2).enable()
+    handle(_t((1, 4)), timestep = _t((1,)), return_dict = False)
+    handle(_t((1, 8)), timestep = _t((1,)), return_dict = False)
+    keys = set(handle.cache)
+    with cg.batch_rows(2, capture = True):
+        handle(_t((2, 4)), timestep = _t((2,)), return_dict = False)
+    assert set(handle.cache) == keys
+    assert handle.stats["batch_eager"] == 1 and handle.stats["evictions"] == 0
+
+
+@side_stream
+def test_out_of_memory_recording_a_batch_drops_only_the_batched_graphs(stub_torch):
+    module = _FakeDiT()
+    handle = _armed(module)
+    handle(_t((1, 4)), timestep = _t((1,)), return_dict = False)
+    with cg.batch_rows(2, capture = True):
+        handle(_t((2, 4)), timestep = _t((2,)), return_dict = False)
+    assert handle.stats["batch_captures"] == 1
+    stub_torch._records["graph_error"] = RuntimeError(
+        "CUDA out of memory. Tried to allocate 2.00 GiB"
+    )
+    with cg.batch_rows(4, capture = True):
+        out = handle(_t((4, 4)), timestep = _t((4,)), return_dict = False)
+    assert out[0].value[0] == "out"
+    assert handle.poisoned is False
+    assert handle.stats["batch_capture_failures"] == 1
+    assert len(handle.cache) == 1 and not handle._batched, "only the size-1 graph is left"
+    assert handle._batched_off
+    replays = handle.stats["replays"]
+    handle(_t((1, 4)), timestep = _t((1,)), return_dict = False)
+    assert handle.stats["replays"] == replays + 1, "the size-1 graph still replays"
+    with cg.batch_rows(2, capture = True):
+        handle(_t((2, 4)), timestep = _t((2,)), return_dict = False)
+    assert handle.stats["batch_eager"] == 1, "no more batched recordings on this load"
+
+
+@side_stream
+def test_a_size_one_capture_failure_still_poisons(stub_torch):
+    stub_torch._records["graph_error"] = RuntimeError("CUDA out of memory")
+    handle = _armed()
+    handle(_t((1, 4)), timestep = _t((1,)), return_dict = False)
+    assert handle.poisoned is True
+
+
+@side_stream
+def test_the_batched_pool_budget_refuses_a_recording(stub_torch, monkeypatch):
+    handle = _armed()
+    handle(_t((1, 4)), timestep = _t((1,)), return_dict = False)
+    handle.stats["pool_bytes"] = 512 * 2**20
+    monkeypatch.setenv(cg.BATCH_GRAPH_POOL_ENV, "600")
+    with cg.batch_rows(2, capture = True):
+        handle(_t((2, 4)), timestep = _t((2,)), return_dict = False)
+    assert handle.stats["batch_captures"] == 0 and handle.stats["batch_eager"] == 1
+    monkeypatch.setenv(cg.BATCH_GRAPH_POOL_ENV, "2048")
+    with cg.batch_rows(2, capture = True):
+        handle(_t((2, 4)), timestep = _t((2,)), return_dict = False)
+    assert handle.stats["batch_captures"] == 1
+
+
+@side_stream
+def test_a_plain_multi_image_request_keeps_todays_graph_rules(stub_torch):
+    """No batch_rows context (one user's batch_size=2): records as before."""
+    handle = _armed()
+    handle(_t((2, 4)), timestep = _t((2,)), return_dict = False)
+    assert handle.stats["captures"] == 1 and handle.stats["batch_captures"] == 0
+
+
+@side_stream
+def test_dropping_one_batch_size_keeps_the_others_and_size_one(stub_torch):
+    handle = _armed()
+    handle(_t((1, 4)), timestep = _t((1,)), return_dict = False)
+    for rows in (2, 4):
+        with cg.batch_rows(rows, capture = True):
+            handle(_t((rows, 4)), timestep = _t((rows,)), return_dict = False)
+    assert handle.drop_batched(2) == 1
+    assert sorted(handle._batched.values()) == [4] and len(handle.cache) == 2
+    assert handle.drop_batched() == 1 and len(handle.cache) == 1
+
+
+class _EditRefDiT(_LenDiT):
+    """A planned (Qwen-Image-2.1-style) step that also takes edit reference states."""
+
+    def forward(
+        self,
+        hidden_states,
+        encoder_hidden_states = None,
+        image_cond_hidden_states = None,
+        return_dict = True,
+    ):
+        self.calls += 1
+        return (_FakeTensor((1, 64), value = ("out", hidden_states.value), tag = "out"),)
+
+
+def _t2i_step(
+    handle,
+    rows = 1,
+    value = 0.0,
+):
+    return handle(
+        _t((rows, 64), value = value), encoder_hidden_states = _t((rows, 3)), return_dict = False
+    )
+
+
+def _edit_step(
+    handle,
+    ref_len,
+    value = 0.0,
+):
+    return handle(
+        _t((1, 64), value = value),
+        encoder_hidden_states = _t((1, 3)),
+        image_cond_hidden_states = _t((1, ref_len)),
+        return_dict = False,
+    )
+
+
+@side_stream
+def test_edits_at_new_reference_sizes_never_evict_the_text_to_image_graphs(stub_torch, monkeypatch):
+    """Warm text-to-image at sizes 1, 2 and 4 (2 and 4 recorded by the race), then edits at three new reference sizes,
+    then text-to-image again: the edits take the batched graphs' slots and then run ungraphed, never the size-1
+    text-to-image graph, so the next plain render replays instead of warming and recording again."""
+    import contextlib
+
+    monkeypatch.delenv(cg.EVERY_LENGTH_ENV, raising = False)
+    module = type("QwenImage21Transformer2DModel", (_EditRefDiT,), {})()
+    handle = _armed(module)
+    orig = handle.orig
+    handle.plan = lambda mod, args, kwargs: (orig, {"hidden_states": args[0], **kwargs})
+    monkeypatch.setattr(_FakeTensor, "is_inference", lambda self: False, raising = False)
+    monkeypatch.setattr(
+        stub_torch, "inference_mode", lambda *a, **k: contextlib.nullcontext(), raising = False
+    )
+    monkeypatch.setattr(cg, "_graph_without_flush", stub_torch.cuda.graph)
+
+    for i in range(3):
+        _t2i_step(handle, 1, value = float(i))
+    for rows in (2, 4):
+        with cg.batch_rows(rows, capture = True):
+            for i in range(3):
+                _t2i_step(handle, rows, value = float(i))
+    assert len(handle.cache) == 3 and sorted(handle._batched.values()) == [2, 4]
+    plain = next(k for k in handle.cache if k not in handle._batched)
+    for ref_len in (16, 24, 32):
+        for i in range(3):
+            _edit_step(handle, ref_len, value = float(i))
+    print("captures", handle.stats["captures"], "evictions", handle.stats["evictions"])
+    assert plain in handle.cache, "an edit evicted the size-1 text-to-image graph"
+    replays = handle.stats["replays"]
+    captures = handle.stats["captures"]
+    _t2i_step(handle, 1, value = 9.0)
+    assert handle.stats["replays"] == replays + 1 and handle.stats["captures"] == captures
+
+
+@side_stream
+def test_true_cfg_edits_at_new_reference_sizes_never_evict_the_text_to_image_graphs(
+    stub_torch, monkeypatch
+):
+    """The same with true CFG (a prompt and a negative key per render): three edit reference sizes are six new keys."""
+    import contextlib
+
+    monkeypatch.delenv(cg.EVERY_LENGTH_ENV, raising = False)
+    module = type("QwenImage21Transformer2DModel", (_EditRefDiT,), {})()
+    handle = _armed(module)
+    orig = handle.orig
+    handle.plan = lambda mod, args, kwargs: (orig, {"hidden_states": args[0], **kwargs})
+    monkeypatch.setattr(_FakeTensor, "is_inference", lambda self: False, raising = False)
+    monkeypatch.setattr(
+        stub_torch, "inference_mode", lambda *a, **k: contextlib.nullcontext(), raising = False
+    )
+    monkeypatch.setattr(cg, "_graph_without_flush", stub_torch.cuda.graph)
+
+    def t2i(value):
+        handle(_t((1, 64), value = value), encoder_hidden_states = _t((1, 3)), return_dict = False)
+        handle(_t((1, 64), value = value), encoder_hidden_states = _t((1, 7)), return_dict = False)
+
+    def edit(ref_len, value):
+        for text in (3, 7):
+            handle(
+                _t((1, 64), value = value),
+                encoder_hidden_states = _t((1, text)),
+                image_cond_hidden_states = _t((1, ref_len)),
+                return_dict = False,
+            )
+
+    for i in range(3):
+        t2i(float(i))
+    plain = set(handle.cache)
+    assert len(plain) == 2
+    for ref_len in (16, 24, 32):
+        for i in range(3):
+            edit(ref_len, float(i))
+    print(
+        "captures",
+        handle.stats["captures"],
+        "evictions",
+        handle.stats["evictions"],
+        "cap_skips",
+        handle.stats["cap_skips"],
+    )
+    assert plain <= set(handle.cache), "an edit evicted a text-to-image graph"
+    replays, captures = handle.stats["replays"], handle.stats["captures"]
+    t2i(9.0)
+    assert handle.stats["replays"] == replays + 2 and handle.stats["captures"] == captures
