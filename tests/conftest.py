@@ -105,8 +105,12 @@ def _fresh_new_mapper_cache():
 
 @pytest.hookimpl(trylast = True)
 def pytest_collection_modifyitems(config, items):
-    """After xdist tags grouped tests; see tests/_shared/xdist_group_check.py."""
+    """After xdist tags grouped tests; see tests/_shared/xdist_group_check.py. Under UNSLOTH_TEST_SPLIT=k/n only
+    part k of the collected tests runs (tests/_shared/shard_split.py)."""
+    from shard_split import select
     from xdist_group_check import check
+
+    select(config, items)
     check(config, items)
 
 
@@ -263,3 +267,10 @@ def _kernel_lock_dir(tmp_path_factory):
 def _isolated_kernel_install_locks(monkeypatch, _kernel_lock_dir):
     # Tests never take (or create) the environment's real kernel install locks.
     monkeypatch.setenv("UNSLOTH_KERNEL_LOCK_DIR", _kernel_lock_dir)
+
+
+# Distributed CPU CI sets UNSLOTH_TEST_RANK_ZYGOTE=1: spawned gloo ranks fork from a process that already ran this
+# file and `import unsloth`, instead of importing both again (tests/_shared/rank_zygote.py says when they may).
+if os.environ.get("UNSLOTH_TEST_RANK_ZYGOTE") == "1":
+    import rank_zygote
+    rank_zygote.install()
