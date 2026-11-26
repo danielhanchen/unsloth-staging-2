@@ -1940,6 +1940,11 @@ function VideoGenerator({
   // Select "match source" only after the staged keyframe passes the aspect-ratio check, and only for a family
   // whose keyframes do not keep the chosen canvas.
   const autoMatchSource = keyframeSelectsMatchSource(status?.defaults);
+  // Memoised so handleGenerate never sends a stale matchedResolution (it updates a render after a frame swap).
+  const generateCanvas = useMemo(
+    () => requestCanvas(sourceSized, matchedResolution, videoSize, !autoMatchSource),
+    [autoMatchSource, matchedResolution, sourceSized, videoSize],
+  );
   const hadKeyframeRef = useRef(false);
   useEffect(() => {
     const has = canvasSource != null;
@@ -4035,7 +4040,7 @@ function VideoGenerator({
           status?.supports_cfg !== false && guidance > 0
             ? negativePrompt.trim() || undefined
             : undefined,
-        ...requestCanvas(sourceSized, matchedResolution, videoSize, !autoMatchSource),
+        ...generateCanvas,
         num_frames: numFrames,
         fps,
         steps,
@@ -4093,8 +4098,7 @@ function VideoGenerator({
     negativePrompt,
     guidance,
     seed,
-    videoSize,
-    sourceSized,
+    generateCanvas,
     numFrames,
     fps,
     steps,
