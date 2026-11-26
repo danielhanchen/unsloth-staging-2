@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+
+import type { SelectOption } from "./nvfp4-options.ts";
+
+/**
+ * The backend's `precision_options` (media status and download plan): each explicit transformer scheme mapped to the
+ * reason this family or card refuses it (a family deny such as Wan NVFP4's failed accuracy gate, or a failed kernel
+ * probe such as rowwise FP8 on Windows), or null when nothing known rules it out. Absent on an older backend.
+ */
+export type PrecisionOptions = Record<string, string | null | undefined> | null | undefined;
+
+function deniedReason(value: string, denials: PrecisionOptions): string | null {
+  const reason = denials?.[value.trim().toLowerCase()];
+  return typeof reason === "string" && reason.trim() ? reason.trim() : null;
+}
+
+/**
+ * Disable each option the backend refuses, with its reason. The backend's reason replaces the NVFP4 switch hint: with
+ * the switch off it only reports a measured failure (Wan NVFP4), which turning the switch on would not fix.
+ */
+export function withPrecisionDenials(options: readonly SelectOption[], denials: PrecisionOptions): SelectOption[] {
+  return options.map((option) => {
+    const reason = deniedReason(option[0], denials);
+    return reason ? [option[0], option[1], reason] : option;
+  });
+}
+
+/** A held pick the backend now refuses falls back to Auto instead of being sent and refused at load. */
+export function deniedSelectionFallback<T extends string>(value: T, denials: PrecisionOptions): T | "auto" {
+  return deniedReason(value, denials) ? "auto" : value;
+}
+
+/** A download plan's denials, with the GPU selection ("auto" or a card index) the plan was made for. */
+export type PlannedPrecision = { gpu: string; options: PrecisionOptions } | null;
+
+/** The GPU selection a request carries: its first explicit card, else "auto". */
+export function gpuSelectionKey(gpuIds: readonly number[] | null | undefined): string {
+  return gpuIds && gpuIds.length > 0 ? String(gpuIds[0]) : "auto";
+}
+
+/**
+ * The denials that describe the next load on `targetGpu`: the loaded build's when that load targets the resident's
+ * card (Auto, or the card the status judged them on), else the last plan's for that same selection, else none. A
+ * kernel-probe failure is per card, so picking another GPU must not inherit the resident card's verdicts.
+ */
+export function activePrecisionDenials(
+  status:
+    | { loaded?: boolean | null; precision_options?: PrecisionOptions; precision_options_card?: number | null }
+    | null
+    | undefined,
+  planned: PlannedPrecision,
+  targetGpu = "auto",
+): PrecisionOptions {
+  const card = status?.precision_options_card;
+  const residentTarget = targetGpu === "auto" || (card != null && String(card) === targetGpu);
+  if (status?.loaded && status.precision_options && residentTarget) return status.precision_options;
+  if (planned && planned.gpu === targetGpu) return planned.options ?? null;
+  return null;
+}
