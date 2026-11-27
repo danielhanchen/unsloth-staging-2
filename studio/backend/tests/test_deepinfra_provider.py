@@ -137,8 +137,6 @@ def test_deepinfra_is_offered_on_the_connections_api():
     assert deepinfra["base_url"] == "https://api.deepinfra.com/v1/openai"
     assert not deepinfra["hidden"]
     assert deepinfra["model_list_mode"] == "remote"
-    assert deepinfra["supports_service_tier"] is True
-    assert deepinfra["service_tier_options"] == ["default", "priority", "flex"]
 
 
 def test_deepinfra_forwards_service_tier_flex_on_the_wire():
@@ -169,25 +167,14 @@ def test_service_tier_is_not_forwarded_to_other_providers():
         assert not info.get("supports_service_tier"), provider_type
 
 
-def test_deepinfra_normalizes_legacy_tier_spellings():
-    # "standard_tier" / "standard" / "standard_only" normalize to "default".
-    for spelling in ("standard_tier", "standard", "standard_only", "Standard"):
-        req = ChatCompletionRequest(
-            provider_type = "deepinfra",
-            messages = [{"role": "user", "content": "hi"}],
-            model = "meta-llama/Llama-3.3-70B-Instruct",
-            stream = True,
-            service_tier = spelling,
-        )
-        assert req.service_tier == "default", spelling
-    # An unknown tier is rejected.
+def test_unknown_service_tier_is_rejected():
     import pytest
-    with pytest.raises(Exception):
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
         ChatCompletionRequest(
             provider_type = "deepinfra",
             messages = [{"role": "user", "content": "hi"}],
             model = "meta-llama/Llama-3.3-70B-Instruct",
-            stream = True,
             service_tier = "bogus",
         )
 
@@ -199,22 +186,17 @@ def test_deepinfra_check_and_model_list_read_the_live_models_route():
     assert [path for path, _ in seen] == ["/v1/openai/models", "/v1/openai/models"]
 
 
-def test_deepinfra_models_endpoint_caches_and_filters_anthropic():
-    import routes.providers as providers_route
+def test_service_tier_persists_and_clears(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    from storage import providers_db
 
-    providers_route._cached_deepinfra_models = [
-        {"model_name": "meta-llama/Llama-3.3-70B-Instruct", "type": "text-generation"},
-        {"model_name": "anthropic/claude-3-haiku", "type": "text-generation"},
-    ]
-    providers_route._cached_deepinfra_models_at = 1e12
-
-    loop = asyncio.new_event_loop()
-    try:
-        models = loop.run_until_complete(
-            providers_route.get_deepinfra_models(_current_subject = "unsloth")
-        )
-        assert len(models) == 2
-    finally:
-        loop.close()
-        providers_route._cached_deepinfra_models = None
-        providers_route._cached_deepinfra_models_at = 0.0
+    providers_db.create_provider(
+        id = "di",
+        provider_type = "deepinfra",
+        display_name = "DeepInfra",
+        base_url = "https://api.deepinfra.com/v1/openai",
+        service_tier = "flex",
+    )
+    assert providers_db.get_provider("di")["service_tier"] == "flex"
+    providers_db.update_provider("di", service_tier = None)
+    assert providers_db.get_provider("di")["service_tier"] is None

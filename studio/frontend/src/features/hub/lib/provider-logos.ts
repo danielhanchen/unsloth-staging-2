@@ -117,7 +117,6 @@ export const PROVIDER_LOGOS: readonly ProviderLogo[] = [
 		prefixes: ["GLM-", "glm-", "chatglm", "codegeex"],
 	},
 
-	// DeepInfra.
 	{
 		id: "deepinfra",
 		name: "DeepInfra",

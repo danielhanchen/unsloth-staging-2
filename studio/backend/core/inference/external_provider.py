@@ -1952,10 +1952,7 @@ class ExternalProviderClient:
         for field in provider_info.get("body_omit", ()):
             body.pop(field, None)
 
-        # DeepInfra service tier: forwarded only for the provider that documents
-        # it, and only for the real tiers. "default" is the absence of the
-        # field (DeepInfra treats it identically), so omit it to keep other
-        # OpenAI-compatible gateways byte-identical.
+        # "default" = field absent upstream.
         if (
             service_tier
             and provider_info.get("supports_service_tier")

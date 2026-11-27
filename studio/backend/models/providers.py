@@ -264,7 +264,7 @@ class ProviderCreate(ExtraHeadersMixin, AutoCompactPercentMixin):
     )
     service_tier: Optional[Literal["default", "priority", "flex"]] = Field(
         None,
-        description = "DeepInfra service tier: default (standard), flex (20% discount, best-effort), priority (50% premium). Only meaningful for DeepInfra connections.",
+        description = "DeepInfra service tier (default, priority, flex)",
     )
     auto_compact_tokens: Optional[int] = Field(
         None,
@@ -320,7 +320,7 @@ class ProviderUpdate(ExtraHeadersMixin, AutoCompactPercentMixin):
     )
     service_tier: Optional[Literal["default", "priority", "flex"]] = Field(
         None,
-        description = "DeepInfra service tier: default (standard), flex (20% discount, best-effort), priority (50% premium). Only meaningful for DeepInfra connections.",
+        description = "DeepInfra service tier (default, priority, flex)",
     )
     auto_compact_tokens: Optional[int] = Field(
         None,
@@ -397,7 +397,7 @@ class ProviderResponse(BaseModel):
     )
     service_tier: Optional[Literal["default", "priority", "flex"]] = Field(
         None,
-        description = "DeepInfra service tier: default (standard), flex (20% discount, best-effort), priority (50% premium). Only meaningful for DeepInfra connections.",
+        description = "DeepInfra service tier (default, priority, flex)",
     )
     auto_compact_tokens: Optional[int] = Field(
         None,

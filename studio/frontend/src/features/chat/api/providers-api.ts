@@ -488,11 +488,6 @@ export async function fetchModelCatalog(): Promise<ModelCatalogResponse> {
   return parseJsonOrThrow<ModelCatalogResponse>(response);
 }
 
-export async function fetchDeepInfraModels(): Promise<any[]> {
-  const response = await authFetch("/api/providers/deepinfra-models");
-  return parseJsonOrThrow<any[]>(response);
-}
-
 export async function listProviderModelCapabilities(payload: {
   providerType: string;
   providerId?: string | null;
