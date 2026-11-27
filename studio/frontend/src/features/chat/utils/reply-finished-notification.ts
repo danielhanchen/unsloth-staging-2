@@ -17,7 +17,6 @@ export const REPLY_SETTLE_MS = 3_000;
 
 let sequence = 0;
 let pending: ReturnType<typeof setTimeout> | null = null;
-// The chat the latest reply ran in, so a click on the notification can open it.
 let pendingThreadId: string | null = null;
 
 function browserNotificationApi(): typeof Notification | null {
@@ -49,7 +48,7 @@ async function openFinishedChat(threadId: string | null): Promise<void> {
   if (!threadId) {
     return;
   }
-  // The router pulls in the whole app, so load it only when a notification is clicked.
+  // Lazy: the router pulls in the whole app.
   const { router } = await import("@/app/router");
   await router.navigate({ to: "/chat", search: { thread: threadId } });
 }

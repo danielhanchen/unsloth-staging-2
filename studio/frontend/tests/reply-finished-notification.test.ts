@@ -380,8 +380,7 @@ test("the setting is a searchable switch in Chat settings that reverts when refu
 });
 
 test("clicking the browser notification focuses the window and survives an unloadable router", async () => {
-  // The app router only loads inside the bundle, so under node the dynamic import rejects;
-  // the click must still focus and close without an unhandled rejection.
+  // Under node the router import rejects; the click must still focus and close.
   const env = await load({ tauri: false, enabled: true, permission: "granted" });
   const clicked: string[] = [];
   const win = (globalThis as unknown as { window: Record<string, unknown> })
