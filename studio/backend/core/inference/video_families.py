@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 from .diffusion_nvfp4_flag import nvfp4_blocked, without_nvfp4
 from .family_name_match import model_identity, normalize_family_name, token_in_name, token_length
@@ -259,8 +259,10 @@ class VideoFamily:
     # One config per reduction instead of a per-process benchmark that can change the render (diffusion_speed.
     # pin_reduction_configs). Off by default: it can keep a slower config (HunyuanVideo-1.5 ~2% per step).
     filter_reduction_configs: bool = False
-    # Same spelling as DiffusionFamily: pin the filter only on these (major, minor) archs.
-    filter_reduction_configs_archs: tuple[tuple[int, int], ...] = field(default_factory = tuple)
+    # Same spelling as DiffusionFamily: pin the filter only on these CUDA (major, minor) archs or ROCm gfx names.
+    filter_reduction_configs_archs: tuple[Union[tuple[int, int], str], ...] = field(
+        default_factory = tuple
+    )
     # Curated GGUF repo for the picker (the DiT as single-file GGUF quants).
     gguf_repo: Optional[str] = None
     # Subdirectory of gguf_repo a bare repo id means; None keeps the root.
@@ -600,6 +602,9 @@ _FAMILIES: tuple[VideoFamily, ...] = (
         supports_torch_compile = True,
         # Near-equal inductor norm-reduction configs rendered different clips per fresh process for one seed.
         filter_reduction_configs = True,
+        # The conditioner's Qwen3-VL Conv3d patch embed reads every reference clip / keyframe: cudnn.benchmark's
+        # per-process algorithm pick moved its output (G4: two clip families per seed), so the denoiser diverged.
+        cudnn_benchmark = False,
         # CUDA graph declined: no measurable win (GPU-bound) for ~8 GB extra memory and 31 s capture.
         supports_cuda_graph = False,
         # Streamed, H3's prequant groups onload through diffusers' stream path, which waits on the host per group: a
@@ -667,6 +672,12 @@ _FAMILIES: tuple[VideoFamily, ...] = (
             preview_factors = "ltx2",
             # The split single-file repo next to the Diffusers pack (safetensors, no remote code).
             trusted_repos = ("lightricks/ltx-2.5",),
+            # An explicit int8 pick on gfx1151 (ROCm 7.13, 512x320x17, 8 steps, 4 repeats) runs W8A8 read from the
+            # hosted ConvRot file; AUTO keeps bf16 (15.11 s/clip). Weight-only quantised at load measured 18.61 s/clip.
+            rdna_explicit_w8a8 = (
+                "hosted int8 W8A8 measured 16.01 vs 18.61 s/clip against weight-only int8 on gfx1151 (512x320x17, "
+                "8 steps), LPIPS 0.102 vs 0.164 against bf16"
+            ),
         ),
         pipeline_class = "LTX2Pipeline",
         transformer_class = "LTX2VideoTransformer3DModel",
@@ -766,8 +777,9 @@ _FAMILIES: tuple[VideoFamily, ...] = (
         label = "Wan2.2 TI2V 5B",
         profile = FamilyProfile(
             scheme_deny = _NVFP4_GATE_FAILED,
-            # Image AUTO rule: INT8 1.18x faster than bf16 (RTX PRO 6000, both resident, compiled), so INT8.
-            auto_prequant_when_resident = frozenset({"int8"}),
+            # No auto_prequant_when_resident: Auto keeps bf16 where the DiT stays resident. Re-gate 2026-11-24 (RTX PRO
+            # 6000, Studio defaults, 8 clips): INT8 weights 0.213 mean / 0.376 max LPIPS vs bf16 (bf16 A/A 0.000), CI
+            # upper 0.289 against the 0.05 video bar, for 1.22x. INT8 stays where bf16 does not fit and on request.
             untiled_vae = UntiledVae(bytes_per_latent_pixel = 2.5 * 2**20, output_scale = (16, 4)),
             preview_factors = "wan22_5b",
             auto_static_skip = (
@@ -829,6 +841,9 @@ _FAMILIES: tuple[VideoFamily, ...] = (
         bf16_components_gb = (10.0, 11.4, 2.8),
         vae_force_fp32 = True,
         cudnn_benchmark = False,
+        # gfx1151: fresh processes rendered one seed into up to 4 clips (two reduction kernels benchmark R0_BLOCK 2048
+        # vs 4096 per process); with the filter every process matched bitwise. NVIDIA was already bit-exact.
+        filter_reduction_configs_archs = ("gfx1151",),
         # Streamed: faster than eager with bit-identical latents; two replays per step (CFG), one graph per shape.
         offload_cuda_graph = True,
         # UMT5 keeps its overflowing `wo` in fp32 itself; the VAE stays fp32 (vae_force_fp32).

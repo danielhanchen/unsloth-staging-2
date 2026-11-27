@@ -8,8 +8,11 @@ import type {
   ProviderAuthStatus,
 } from "./api/providers-api";
 import { modelCatalogSupportsVision } from "./model-catalog.ts";
+import { normalizeProviderBaseUrl } from "./provider-base-url.ts";
 import {
   normalizeAutoCompactTokens,
+  normalizeAutoCompactPercent,
+  normalizeAutoCompactPercentByModel,
   normalizeCompactionMode,
   type ProviderCompactionMode,
 } from "./utils/auto-compaction.ts";
@@ -38,6 +41,9 @@ export interface ExternalProviderConfig {
   serviceTier?: "default" | "priority" | "flex";
   /** Tokens after which chats on this connection compact; unset uses 75% of the model's window. */
   autoCompactTokens?: number;
+  /** Percent of the model's window; replaces autoCompactTokens. */
+  autoCompactPercent?: number;
+  autoCompactPercentByModel?: Record<string, number>;
   compactionMode?: ProviderCompactionMode;
   extraHeaders?: Record<string, string>;
 
@@ -171,6 +177,7 @@ export type ProviderModelCapability = {
   vision?: boolean;
   studio_tools?: boolean;
   thinking?: boolean;
+  thinkingByBaseUrl?: Record<string, boolean>;
 };
 
 const REGISTRY_MODEL_CAPABILITIES = new Map<
@@ -345,17 +352,29 @@ export function providerModelSupportsStudioTools(
 export function providerModelSupportsThinking(
   providerType: string | null | undefined,
   modelId: string | null | undefined,
+  baseUrl?: string | null,
 ): boolean | null {
   if (!providerType || !modelId) return null;
   hydrateProviderModelCapabilities();
+  const capability = registryCapabilitiesFor(providerType)?.[modelId];
   const value =
-    registryCapabilitiesFor(providerType)?.[modelId]?.thinking;
+    capability?.thinkingByBaseUrl?.[thinkingBaseUrlKey(baseUrl)] ??
+    capability?.thinking;
   return typeof value === "boolean" ? value : null;
+}
+
+function thinkingBaseUrlKey(baseUrl: string | null | undefined): string {
+  try {
+    return normalizeProviderBaseUrl(baseUrl ?? "", { appendOpenAiVersionPath: true }) ?? "";
+  } catch {
+    return baseUrl?.trim().replace(/\/+$/, "") ?? "";
+  }
 }
 
 export function learnCatalogModelCapabilities(
   providerType: string,
   models: readonly { id: string; capabilities?: string[] | null }[],
+  baseUrl?: string | null,
 ): void {
   if (!providerType) return;
   const stored = getProviderModelCapabilities(providerType) ?? {};
@@ -367,7 +386,10 @@ export function learnCatalogModelCapabilities(
     if (!modelId || !Array.isArray(names)) continue;
     merged[modelId] = {
       ...stored[modelId],
-      thinking: names.includes("thinking"),
+      thinkingByBaseUrl: {
+        ...stored[modelId]?.thinkingByBaseUrl,
+        [thinkingBaseUrlKey(baseUrl)]: names.includes("thinking"),
+      },
     };
     learned = true;
   }
@@ -813,6 +835,10 @@ function normalizeProvider(raw: ExternalProviderConfig): ExternalProviderConfig 
         ? normalizeServiceTier(raw.serviceTier)
         : undefined,
     autoCompactTokens: normalizeAutoCompactTokens(raw.autoCompactTokens),
+    autoCompactPercent: normalizeAutoCompactPercent(raw.autoCompactPercent),
+    autoCompactPercentByModel: normalizeAutoCompactPercentByModel(
+      raw.autoCompactPercentByModel,
+    ),
     compactionMode: normalizeCompactionMode(raw.compactionMode),
     extraHeaders: extraHeadersFromSaved(raw.extraHeaders),
     enablePromptCaching: supportsProviderPromptCaching(providerType)
