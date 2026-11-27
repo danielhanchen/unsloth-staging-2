@@ -64,6 +64,7 @@ function pendingRun(hasReservation = true) {
     cancelReplyFinishedNotification: () => {
       cancels += 1;
     },
+    isThreadIncognito: () => false,
   };
   const factory = new Function(
     ...Object.keys(deps),
