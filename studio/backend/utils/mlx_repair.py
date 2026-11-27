@@ -32,7 +32,7 @@ _MLX_PACKAGE_NAMES = tuple(_MLX_MIN_VERSIONS)
 _MLX_RUNTIME_IMPORTS = ("mlx.core", "mlx_lm", "mlx_lm.sample_utils", "mlx_vlm")
 # What the self-heal INSTALLS; keep in sync with unsloth-zoo's darwin deps. mlx pinned: it breaks in patch releases (unslothai/unsloth#9466), and 0.32.2's GQA-8 decode read row 0's KV for every batch row (mlx#4431). mlx-vlm is a range (the transformers override decides how high it resolves); mlx-lm too: 0.32 needs Python 3.11.
 _MLX_INSTALL_SPECS = {
-    "mlx": "==0.32.4",
+    "mlx": "==0.32.5",
     "mlx-lm": ">=0.31.3,<=0.32.2",
     "mlx-vlm": ">=0.6.4,<=0.8.1",
 }
@@ -83,12 +83,16 @@ def _mlx_minimum(name: str) -> str:
 
 def _install_packages() -> tuple[str, ...]:
     """mlx-lm and mlx-vlm are narrowed to the specifier unsloth-zoo declares, as their call shapes
-    must match it; mlx is pinned exactly at both ends, so intersecting it would empty the range;
-    uv intersects both."""
+    must match it. mlx takes the zoo's exact pin when it has one: intersecting two exact pins empties
+    the range, and ours beside a zoo pinning another release resolves back to the zoo's on update."""
     packages = []
     for name, spec in _MLX_INSTALL_SPECS.items():
-        declared = _zoo_declared_specifier(name) if name in ("mlx-lm", "mlx-vlm") else ""
-        packages.append(f"{name}{spec},{declared}" if declared else f"{name}{spec}")
+        declared = _zoo_declared_specifier(name)
+        if name == "mlx":
+            exact = declared.startswith("==") and not any(c in declared for c in ",*")
+            packages.append(f"{name}{declared if exact else spec}")
+        else:
+            packages.append(f"{name}{spec},{declared}" if declared else f"{name}{spec}")
     return tuple(packages)
 
 
