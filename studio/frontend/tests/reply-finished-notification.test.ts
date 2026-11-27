@@ -123,7 +123,9 @@ async function load(env: Env) {
   const store = await import(`${STORE}?bust=${generation}`);
   store.useChatPreferencesStore.setState({ notifyWhenReplyFinishes: enabled });
   const mod = (await import(`${MODULE}?bust=${generation}`)) as {
-    notifyReplyFinished: () => void;
+    notifyReplyFinished: (
+      destination?: { thread: string } | { compare: string } | null,
+    ) => void;
     cancelReplyFinishedNotification: () => void;
     requestReplyFinishedPermission: () => Promise<boolean>;
     REPLY_SETTLE_MS: number;
@@ -356,10 +358,24 @@ test("the run adapter cancels on start and notifies once after the stream ends, 
   const body = source.slice(start, source.indexOf("\nfunction ", start + 1));
   assert.match(
     body,
-    /yield\* result;\n\s*\} else \{\n\s*yield await result;\n\s*\}\n\s*if \(!options\.abortSignal\?\.aborted\) \{\n\s*notifyReplyFinished\(\);/,
+    /yield\* result;\n\s*\} else \{\n\s*yield await result;\n\s*\}\n\s*if \(!options\.abortSignal\?\.aborted\) \{\n\s*const threadId = adoptedThreadId \?\? options\.unstable_threadId;/,
   );
-  assert.equal(body.match(/notifyReplyFinished\(\)/g)?.length, 1);
+  assert.equal(body.match(/notifyReplyFinished\(/g)?.length, 1);
   assert.match(body, /async \*run\(options\) \{\n\s*cancelReplyFinishedNotification\(\);/);
+});
+
+test("a comparison reply opens its comparison and a temporary chat only focuses", () => {
+  const source = readSrc("features/chat/runtime-provider.tsx");
+  const start = source.indexOf("function createPersistedRunAdapter(");
+  const body = source.slice(start, source.indexOf("\nfunction ", start + 1));
+  assert.match(
+    body,
+    /pairId\s*\?\s*\{ compare: pairId \}\s*:\s*threadId && !isThreadIncognito\(threadId\)\s*\?\s*\{ thread: threadId \}\s*:\s*null/,
+  );
+  assert.match(
+    source,
+    /createPersistedRunAdapter\(\s*createOpenAIStreamAdapter\(\{ modelType, pairId \}\),\s*pairId,\s*\)/,
+  );
 });
 
 test("the setting is a searchable switch in Chat settings that reverts when refused", async () => {
@@ -376,5 +392,46 @@ test("the setting is a searchable switch in Chat settings that reverts when refu
   );
   assert.ok(
     SETTINGS_SEARCH_INDEX.chat.includes("settings.chat.replyNotification"),
+  );
+});
+
+test("clicking the browser notification focuses the window and survives an unloadable router", async () => {
+  // Under node the router import rejects; the click must still focus and close.
+  const env = await load({ tauri: false, enabled: true, permission: "granted" });
+  const clicked: string[] = [];
+  const win = (globalThis as unknown as { window: Record<string, unknown> })
+    .window;
+  win.focus = () => clicked.push("focus");
+  const Real = win.Notification as (new (...a: never[]) => unknown) & {
+    permission: string;
+  };
+  const made: { onclick: (() => void) | null; close: () => void }[] = [];
+  const Spy = function () {
+    const instance = { onclick: null, close: () => clicked.push("close") };
+    made.push(instance);
+    return instance;
+  } as unknown as typeof Real;
+  Spy.permission = Real.permission;
+  win.Notification = Spy;
+  env.mod.notifyReplyFinished({ thread: "thread-abc" });
+  mock.timers.tick(3_000);
+  assert.equal(made.length, 1);
+  made[0].onclick?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(clicked, ["focus", "close"]);
+});
+
+test("a click opens the chat the reply ran in through the lazily loaded router", () => {
+  const source = readSrc("features/chat/utils/reply-finished-notification.ts");
+  assert.match(source, /await import\("@\/app\/router"\)/);
+  assert.match(
+    source,
+    /router\.navigate\(\{ to: "\/chat", search: destination \}\)/,
+  );
+  assert.match(source, /openFinishedChat\(destination\)/);
+  assert.doesNotMatch(
+    source,
+    /^import .*@\/app\/router/m,
+    "a static router import would pull the whole app into this module",
   );
 });
