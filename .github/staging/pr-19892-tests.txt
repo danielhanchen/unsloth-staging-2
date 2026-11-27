@@ -1,0 +1,1 @@
+studio/backend/tests/test_train_precision_scheme_contract.py
