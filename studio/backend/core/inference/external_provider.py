@@ -35,6 +35,7 @@ from core.inference.openai_responses_shared import (
 from core.inference.sse_control_frames import sanitize_provider_sse_line
 from core.inference.http_stream import aiter_sse_lines
 from models.providers import (
+    custom_reasoning_effort_levels,
     normalize_provider_extra_headers,
     normalize_provider_reasoning_config,
     render_provider_extra_headers,
@@ -1567,19 +1568,23 @@ def _apply_custom_reasoning_controls(
     if not config or not config["enabled"]:
         return
     off = enable_thinking is False or reasoning_effort == "none"
+    levels = custom_reasoning_effort_levels(config)
     # Explicit off must still reach the server when a previous model left a wider effort level.
-    if (
-        not off
-        and reasoning_effort is not None
-        and reasoning_effort not in {"low", "medium", "high"}
-    ):
+    if not off and reasoning_effort is not None and reasoning_effort not in levels:
         return
-    effort = "none" if off else (reasoning_effort or "medium")
+    if off:
+        effort = "none"
+    else:
+        effort = reasoning_effort or ("medium" if "medium" in levels else None)
     style = config["style"]
     if style == "reasoning_effort":
-        body["reasoning_effort"] = effort
+        if effort is not None:
+            body["reasoning_effort"] = effort
     elif style == "reasoning":
-        body["reasoning"] = {"enabled": False} if off else {"effort": effort}
+        if off:
+            body["reasoning"] = {"enabled": False}
+        else:
+            body["reasoning"] = {"effort": effort} if effort else {"enabled": True}
     elif style == "thinking":
         body["thinking"] = {"type": "disabled" if off else "enabled"}
     elif style == "chat_template_kwargs.enable_thinking":
