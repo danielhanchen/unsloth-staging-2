@@ -12,10 +12,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { formatBytes } from "@/features/hub";
-import {
-  FolderBrowser,
-  invalidateLlamaFlagCatalog,
-} from "@/features/model-picker";
+import { FolderBrowser } from "@/features/model-picker";
+import { afterLlamaFolderChanged } from "@/hooks/use-llama-update-check";
 import { type TranslationKey, useT } from "@/i18n";
 import { toast } from "@/lib/toast";
 import { useEffect, useState } from "react";
@@ -23,6 +21,7 @@ import {
   type LlamaBackendOption,
   isLlamaBackend,
   llamaBackendSelectionNeedsApply,
+  llamaBackendUnavailableKey,
   visibleLlamaBackendOptions,
 } from "../api/llama-backend";
 import {
@@ -117,6 +116,7 @@ function LlamaCppPathRow({ onChanged }: { onChanged: () => void }) {
           "settings.resources.llamaBackend.customPath.description",
         )}
         hint={t("settings.resources.llamaBackend.customPath.hint")}
+        wideControl={true}
         className="max-[840px]:flex-col max-[840px]:items-stretch max-[840px]:gap-2"
         below={
           detail || settings?.source === "studio" ? (
@@ -161,7 +161,7 @@ function LlamaCppPathRow({ onChanged }: { onChanged: () => void }) {
               }
             }}
             title={settings?.resolvedBinary ?? settings?.path ?? undefined}
-            className="h-8 min-w-0 font-mono text-xs"
+            className="h-control min-w-0 font-mono text-xs"
             data-testid="llama-cpp-path-input"
           />
           <Button
@@ -223,8 +223,6 @@ export function LlamaBackendSection() {
     if (option.backend !== "auto") {
       return backendDisplayName(option.backend, t);
     }
-    // "Automatic" alone hides the decision; naming what it picks is the
-    // difference between an informed choice and a shot in the dark.
     return option.resolvedBackend
       ? t("settings.resources.llamaBackend.autoWith", {
           backend: backendDisplayName(option.resolvedBackend, t),
@@ -234,8 +232,7 @@ export function LlamaBackendSection() {
 
   const job = status?.job;
   const envLocked = status?.envBackend != null;
-  // Null means the marker holds a choice a newer Unsloth wrote. Show it as
-  // unknown rather than as Automatic, and let it be replaced deliberately.
+  // Null means a newer Unsloth wrote the choice; show it as unknown, not Automatic.
   const unknownRecorded = status?.backendRequest === null;
   // A value with no item renders a blank Select that reads as "no backends at all".
   const statusPending = !status && !loadError;
@@ -249,6 +246,10 @@ export function LlamaBackendSection() {
     selected ?? status?.backendRequest ?? null,
   );
   const pending = options.find((option) => option.backend === value);
+  // A greyed option can only say a few words; its fix (the usermod line) goes below the row.
+  const unavailableHints = options.filter(
+    (option) => !option.available && option.unavailableHint,
+  );
   const dirty = !running && llamaBackendSelectionNeedsApply(status, selected);
   const unsupportedKey =
     status && !status.supported && !running
@@ -281,8 +282,7 @@ export function LlamaBackendSection() {
           >
             <SelectTrigger
               aria-label={t("settings.resources.llamaBackend.label")}
-              className="w-52"
-              size="sm"
+              className="w-52 data-[size=default]:h-control"
               data-testid="llama-backend-select"
             >
               <SelectValue />
@@ -298,21 +298,38 @@ export function LlamaBackendSection() {
                   {t("settings.resources.environment.unknown")}
                 </SelectItem>
               ) : null}
-              {options.map((option) => (
-                <SelectItem key={option.backend} value={option.backend}>
-                  {optionLabel(option)}
-                </SelectItem>
-              ))}
+              {options.map((option) => {
+                const unavailableKey = llamaBackendUnavailableKey(option);
+                return (
+                  <SelectItem
+                    key={option.backend}
+                    value={option.backend}
+                    // The recorded choice stays pickable so the Select keeps a value.
+                    disabled={
+                      unavailableKey !== null &&
+                      option.backend !==
+                        (selected ?? status?.backendRequest ?? null)
+                    }
+                    data-testid={`llama-backend-option-${option.backend}`}
+                  >
+                    {unavailableKey
+                      ? t("settings.resources.llamaBackend.unavailableOption", {
+                          backend: optionLabel(option),
+                          reason: t(
+                            `settings.resources.llamaBackend.unavailable.${unavailableKey}`,
+                          ),
+                        })
+                      : optionLabel(option)}
+                  </SelectItem>
+                );
+              })}
             </SelectContent>
           </Select>
           <Button
             size="sm"
             onClick={apply}
-            // The same hard blockers as the Select above, not just dirtiness. An
-            // environment pin with an automatic choice that has since drifted leaves
-            // selectionApplied false, so the row is dirty while the Select is disabled:
-            // Apply would then be the only live control, and the server rightly refuses
-            // it with environment_override. Do not offer an action that cannot succeed.
+            // Same blockers as the Select: an env pin can leave the row dirty while the server
+            // would refuse it.
             disabled={!dirty || !status?.supported || envLocked}
             data-testid="llama-backend-apply"
           >
@@ -325,7 +342,7 @@ export function LlamaBackendSection() {
 
       <LlamaCppPathRow
         onChanged={() => {
-          invalidateLlamaFlagCatalog();
+          afterLlamaFolderChanged();
           void refresh(true);
         }}
       />
@@ -343,9 +360,20 @@ export function LlamaBackendSection() {
         </div>
       ) : null}
 
+      {unavailableHints.map((option) => (
+        <p
+          key={option.backend}
+          className="pb-3 text-xs text-muted-foreground"
+          data-testid={`llama-backend-hint-${option.backend}`}
+        >
+          {t("settings.resources.llamaBackend.unavailableHint", {
+            backend: optionLabel(option),
+            hint: option.unavailableHint ?? "",
+          })}
+        </p>
+      ))}
+
       {dirty ? (
-        // The two things a switch costs, said before it is paid: a download, and
-        // the loaded model going away with the server it runs in.
         <p className="pb-3 text-xs text-muted-foreground">
           {pending?.downloadSizeBytes
             ? t("settings.resources.llamaBackend.applyHintWithSize", {

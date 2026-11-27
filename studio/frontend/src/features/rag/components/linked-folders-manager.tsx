@@ -23,11 +23,17 @@ import { Progress } from "@/components/ui/progress";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import { isTauri } from "@/lib/api-base";
-import { SOURCE_FOLDER_DESCRIPTION, sourceFolderUnavailableMessage } from "./source-folder-copy";
+import {
+  FOLDER_SYNC_HELP,
+  SOURCE_FOLDER_DESCRIPTION,
+  folderSyncLabel,
+  folderSyncProgress,
+  sourceFolderUnavailableMessage,
+} from "./source-folder-copy";
 import { RefreshGlyph } from "@/lib/refresh-icon";
-import { FolderAddIcon, FolderSyncIcon } from "@hugeicons/core-free-icons";
+import { MoreHorizontalIcon } from "@hugeicons/core-free-icons";
+import { FolderAddIcon, FolderSyncIcon } from "@/lib/folder-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { MoreHorizontalIcon } from "lucide-react";
 import { useState } from "react";
 import type {
   FolderSyncJob,
@@ -37,7 +43,6 @@ import type {
 } from "../types/rag";
 import { useLinkedFolders } from "./use-linked-folders";
 
-/** Grouped folder card, shared with the create project dialog. */
 export const FOLDER_CARD_CLASS =
   "overflow-hidden rounded-xl border border-border bg-background dark:border-transparent dark:bg-[rgb(255_255_255_/_calc(0.06*var(--contrast-wash-gain,1)))]";
 export const FOLDER_ROW_CLASS =
@@ -54,13 +59,25 @@ function jobSummary(job: FolderSyncJob): string {
     const indexed = job.indexedFiles ?? job.processedFiles;
     return indexed == null
       ? "Sync complete"
-      : `${indexed} file${indexed === 1 ? "" : "s"} indexed`;
+      : `${indexed} file${indexed === 1 ? "" : "s"} indexed this sync`;
+  }
+  const folderProgress = folderSyncProgress(job);
+  if (folderProgress) {
+    return folderSyncLabel(folderProgress.synced, folderProgress.discovered);
   }
   const processed = job.processedFiles ?? 0;
   const discovered = job.discoveredFiles;
   return discovered == null
     ? job.stage || "Scanning folder"
     : `${processed} of ${discovered} files`;
+}
+
+function jobPercent(job: FolderSyncJob | undefined): number | null {
+  if (!job) return null;
+  const folderProgress = folderSyncProgress(job);
+  return folderProgress
+    ? percent(folderProgress.synced / folderProgress.discovered)
+    : percent(job.progress);
 }
 
 const SKIP_LABELS: Record<LinkedFolderSkipReason, (count: number) => string> = {
@@ -138,8 +155,6 @@ export function LinkedFoldersManager({
 }: {
   scope?: LinkedFolderScope;
   compact?: boolean;
-  /** "panel" is the settings-style block with its own heading and Link folder button. "card" is
-   *  the grouped list a dialog shows: one row per folder, an Add folder row at the foot of it. */
   variant?: "panel" | "card";
   onSourcesChanged?: () => void;
 }) {
@@ -149,7 +164,6 @@ export function LinkedFoldersManager({
     name: string;
   } | null>(null);
 
-  /** Whether the folder has a sync in flight, which is what the row reports while it does. */
   function runningJob(folderId: string): FolderSyncJob | undefined {
     const job = manager.jobs[folderId];
     return job?.status === "pending" || job?.status === "running"
@@ -157,8 +171,6 @@ export function LinkedFoldersManager({
       : undefined;
   }
 
-  /** The row's own actions, identical in both layouts: a card row's "×" would have to drop three
-   *  of them, and syncing a folder by hand is the reason most people open this list. */
   function folderMenu(folder: (typeof manager.folders)[number], running: boolean) {
     return (
       <DropdownMenu>
@@ -173,7 +185,7 @@ export function LinkedFoldersManager({
             {running ? (
               <Spinner className="size-3.5" />
             ) : (
-              <MoreHorizontalIcon className="size-4" />
+              <HugeiconsIcon icon={MoreHorizontalIcon} className="size-4" />
             )}
           </Button>
         </DropdownMenuTrigger>
@@ -212,7 +224,6 @@ export function LinkedFoldersManager({
     );
   }
 
-  /** The confirmation the destructive unlink opens. Mounted by whichever layout rendered. */
   const removeIndexConfirm = (
     <AlertDialog
       open={removeIndexFolder !== null}
@@ -246,8 +257,6 @@ export function LinkedFoldersManager({
     </AlertDialog>
   );
 
-  // One grouped card: the folders, then the row that adds another. A dialog has a name field
-  // above it in the same shape, so the two read as one stack rather than a panel inside a panel.
   if (variant === "card") {
     const rowClass = FOLDER_ROW_CLASS;
     return (
@@ -264,8 +273,6 @@ export function LinkedFoldersManager({
               const running = runningJob(folder.id) !== undefined;
               const failed =
                 folder.status === "error" || job?.status === "failed";
-              // A settled row is its name alone, the way a list of folders reads. The detail line
-              // is for the states that need one; what is indexed stays on the row's tooltip.
               const detail = running
                 ? jobSummary(job as FolderSyncJob)
                 : failed
@@ -300,13 +307,14 @@ export function LinkedFoldersManager({
                           "truncate text-ui-11 text-muted-foreground",
                           failed && "text-destructive",
                         )}
+                        title={running && !failed ? FOLDER_SYNC_HELP : detail}
                       >
                         {detail}
                       </p>
                     ) : null}
                     {running ? (
                       <Progress
-                        value={percent(job?.progress) ?? 0}
+                        value={jobPercent(job) ?? 0}
                         aria-label={`Sync progress for ${folder.displayName}`}
                         className="mt-1.5 h-1"
                       />
@@ -324,8 +332,7 @@ export function LinkedFoldersManager({
               type="button"
               disabled={!manager.desktopSupported || manager.mutating}
               onClick={() => void manager.link()}
-              // Named for what it does; the title is the tooltip saying why it cannot, which
-              // would otherwise be read out as the row's name.
+              // The title is the tooltip saying why it is disabled, which would otherwise be read as the name.
               aria-label="Add folder"
               title={
                 manager.desktopSupported
@@ -350,8 +357,6 @@ export function LinkedFoldersManager({
             </button>
           ) : null}
         </div>
-        {/* Only where it changes what the row above can do: in the browser build there is no
-            native folder picker, and the rows already linked keep syncing regardless. */}
         {!manager.desktopSupported ? (
           <p className="px-1 text-ui-11 text-muted-foreground">
             {sourceFolderUnavailableMessage(isTauri)} Existing source folders
@@ -381,7 +386,7 @@ export function LinkedFoldersManager({
             type="button"
             size="sm"
             variant="outline"
-            className="shrink-0"
+            className="mt-[var(--ui-title-cap-inset)] shrink-0"
             disabled={!manager.desktopSupported || manager.mutating}
             onClick={() => void manager.link()}
             title={
@@ -417,7 +422,7 @@ export function LinkedFoldersManager({
             const job = manager.jobs[folder.id];
             const running =
               job?.status === "pending" || job?.status === "running";
-            const progress = percent(job?.progress);
+            const progress = jobPercent(job);
             return (
               <li
                 key={folder.id}
@@ -451,6 +456,7 @@ export function LinkedFoldersManager({
                       (folder.status === "error" || job?.status === "failed") &&
                         "text-destructive",
                     )}
+                    title={running ? FOLDER_SYNC_HELP : undefined}
                   >
                     {job
                       ? jobSummary(job)

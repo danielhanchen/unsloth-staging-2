@@ -18,6 +18,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { modelDisplayName } from "../../model-picker/model-config/model-identity";
+import { npuDisplayNameNow } from "@/features/npu";
 import {
   CHAT_HISTORY_UPDATED_EVENT,
   type ChatHistoryUpdatedDetail,
@@ -40,10 +41,7 @@ import {
 export function useChatCreatedModel(
   threadId: string | undefined,
 ): ChatModelSwitchTarget | null {
-  // Keyed by the chat it was read for, not a bare value. Clearing it in the effect is a frame late:
-  // the effect is passive, so the first render for the incoming chat has already committed with
-  // the outgoing chat's model, painting the wrong notice. Answering only for a matching key makes
-  // that render impossible rather than brief.
+  // Keyed by chat: clearing in a passive effect is a frame late and paints the old chat's model.
   const [read, setRead] = useState<{
     threadId: string;
     model: ChatModelSwitchTarget | null;
@@ -92,10 +90,8 @@ type ChatModelNoticeProps = {
   active: boolean;
   /** The saved chat on screen, or undefined for an unsent New Chat. */
   threadId: string | undefined;
-  /** The model the composer will actually send to. */
   checkpoint: string;
   activeGgufVariant: string | null;
-  /** Every model that can be selected right now, by id. */
   selectableModelIds: ReadonlySet<string>;
   loadedModels: readonly LoadedChatModelSlot[];
   onSwitch: (target: ChatModelSwitchTarget) => void;
@@ -175,6 +171,7 @@ export function ChatModelNotice({
   const switchTarget = { ...createdModel, modelId: selectableId };
   const label =
     externalModelLabel(createdModel.modelId) ??
+    npuDisplayNameNow(createdModel.modelId) ??
     modelDisplayName(createdModel.modelId);
   return (
     <Popover key={threadId}>

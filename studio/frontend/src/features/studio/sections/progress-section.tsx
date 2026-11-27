@@ -23,10 +23,7 @@ import { usePlatformStore } from "@/config/env";
 import { MLX_OPTIMIZER_OPTIONS, OPTIMIZER_OPTIONS } from "@/config/training";
 import { useIsAccountOwner } from "@/features/auth";
 import { setTrainingCompareHandoff } from "@/features/chat";
-import {
-  updateSystemOneSettings,
-  useSettingsDialogStore,
-} from "@/features/settings";
+import { tryFineTuneInDecisionApi } from "@/features/settings";
 import {
   getTrainingMethodLabel,
   type TrainingViewData,
@@ -36,6 +33,7 @@ import {
   useTrainingRuntimeStore,
 } from "@/features/training";
 import { useGpuUtilization } from "@/hooks";
+import type { RunParallelInfo } from "@/features/training/types/parallel";
 import type { GpuUtilization } from "@/hooks/use-gpu-utilization";
 import { type TranslationKey, useT } from "@/i18n";
 import { toast } from "@/lib/toast";
@@ -44,14 +42,14 @@ import {
   Alert02Icon,
   ChartAverageIcon,
   DashboardSpeed01Icon,
-  FolderExportIcon,
   Notebook01Icon,
   RamMemoryIcon,
-  StopIcon,
   TaskDone01Icon,
   TemperatureIcon,
   ZapIcon,
 } from "@hugeicons/core-free-icons";
+import { FolderExportIcon } from "@/lib/folder-icons";
+import { StopIcon } from "@/lib/media-control-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { type ReactElement, type ReactNode, useState } from "react";
@@ -65,6 +63,7 @@ import {
   sessionStepsPerSecond,
 } from "./progress-section-lib";
 import type { RunConfigOverride } from "./run-config-override";
+import { RankMemoryStrip, RunParallelChip } from "./run-parallel";
 
 type ConfigGroup = {
   section: string;
@@ -173,7 +172,6 @@ export function ProgressSection({
     await navigate({ to: "/chat" });
   };
 
-  // A finished run can be exported to GGUF: deep-link to Export with this run preselected.
   const exportRunName = data.outputDir
     ? (data.outputDir.replace(/[/\\]+$/, "").split(/[/\\]/).pop() || null)
     : null;
@@ -181,6 +179,7 @@ export function ProgressSection({
     !data.isTrainingRunning &&
     !!exportRunName &&
     !data.resumedLater &&
+    data.artifactsAvailable !== false &&
     (data.phase === "completed" || data.phase === "stopped");
   const canExportGguf = hasFinishedOutput && !data.isDecision;
   const canUseInDecisionApi = hasFinishedOutput && !!data.isDecision && isOwner;
@@ -194,9 +193,7 @@ export function ProgressSection({
     }
     setEnablingDecisionApi(true);
     try {
-      const model = `laya-ft:${exportRunName}`;
-      await updateSystemOneSettings({ enabled: true, model });
-      useSettingsDialogStore.getState().openDecisionTry(model);
+      await tryFineTuneInDecisionApi(exportRunName);
       toast.success(
         t("studio.progress.decisionApiEnabled", { name: exportRunName }),
       );
@@ -223,7 +220,7 @@ export function ProgressSection({
     ? data.currentGradNorm
     : (lastValue(data.gradNormHistory) ?? data.currentGradNorm);
 
-  // Prefer the run's saved snapshot when present (#6853); History shows blanks, never form values.
+  // History shows blanks, never form values.
   const cfg = configOverride ?? (isHistorical ? undefined : config);
   const cfgEpochs = cfg?.epochs;
   const cfgBatchSize = cfg?.batchSize;
@@ -237,7 +234,7 @@ export function ProgressSection({
   const cfgLoraDropout = cfg?.loraDropout;
   const cfgLoraVariant = cfg?.loraVariant;
 
-  // Mirror the training form: on Mac the MLX backend runs CUDA optimizers as AdamW.
+  // On Mac the MLX backend runs CUDA optimizers as AdamW.
   const effectiveOptimizer =
     platformDeviceType === "mac" &&
     OPTIMIZER_OPTIONS.some((o) => o.value === cfgOptimizerType)
@@ -343,6 +340,7 @@ export function ProgressSection({
                 {data.projectName}
               </span>
             )}
+            {data.parallel && <RunParallelChip parallel={data.parallel} />}
             <span className="text-ui-10 tabular-nums text-muted-foreground">
               {t("studio.progress.epoch", {
                 value: formatNumber(data.currentEpoch, 2),
@@ -366,11 +364,12 @@ export function ProgressSection({
             <Progress value={pct} className="h-2 bg-[color-mix(in_oklab,var(--foreground)_calc(5%*var(--contrast-wash-gain,1)),transparent)]" />
           </div>
 
-          {!isHistorical && (
+          {(!isHistorical || hasFinishedOutput) && (
             <MilestoneCallout
               showCompletedHint={showCompletedHint}
-              showHalfwayHint={showHalfwayHint}
+              showHalfwayHint={!isHistorical && showHalfwayHint}
               onCompareInChat={handleCompareInChat}
+              exportRunName={hasFinishedOutput ? exportRunName : null}
             />
           )}
 
@@ -447,7 +446,10 @@ export function ProgressSection({
         </div>
 
         {!isHistorical && (
-          <LiveGpuPanel isTrainingRunning={data.isTrainingRunning} />
+          <LiveGpuPanel
+            isTrainingRunning={data.isTrainingRunning}
+            parallel={data.parallel ?? null}
+          />
         )}
       </div>
     </SectionCard>
@@ -456,11 +458,14 @@ export function ProgressSection({
 
 function LiveGpuPanel({
   isTrainingRunning,
+  parallel,
 }: {
   isTrainingRunning: boolean;
+  parallel: RunParallelInfo | null;
 }): ReactElement {
   const t = useT();
-  const [selectedGpu, setSelectedGpu] = useState(0);
+  // null: follow the run's first GPU until the user picks one.
+  const [selectedGpu, setSelectedGpu] = useState<number | null>(null);
   const gpuData = useGpuUtilization(isTrainingRunning);
   const gpus: GpuUtilization[] =
     Array.isArray(gpuData?.devices) && gpuData.devices.length > 0
@@ -470,7 +475,11 @@ function LiveGpuPanel({
         : [];
 
   const gpuCount = gpus.length;
-  const selectedGpuIndex = selectedGpu >= 0 && selectedGpu < gpuCount ? selectedGpu : 0;
+  const runGpu = parallel?.gpuIds.length
+    ? gpus.findIndex((device) => device.index === parallel.gpuIds[0])
+    : -1;
+  const wanted = selectedGpu ?? Math.max(runGpu, 0);
+  const selectedGpuIndex = wanted >= 0 && wanted < gpuCount ? wanted : 0;
   const currentGpu: Partial<GpuUtilization> = gpus[selectedGpuIndex] || {};
 
   return (
@@ -505,6 +514,7 @@ function LiveGpuPanel({
           {t("studio.progress.live")}
         </span>
       </div>
+      {parallel && <RankMemoryStrip parallel={parallel} devices={gpus} />}
       <div className="grid grid-cols-2 gap-2.5">
         <GpuStat
           label={t("studio.progress.utilization")}
@@ -625,7 +635,7 @@ function ConfigPopoverButton({
           <p className="text-xs font-semibold">{t("studio.progress.configLabel")}</p>
           {configItems.map((group) => (
             <div key={group.section} className="flex flex-col gap-1">
-              <p className="text-ui-10 font-semibold uppercase tracking-wider text-muted-foreground">
+              <p className="text-ui-11 font-semibold text-muted-foreground">
                 {group.section}
               </p>
               {group.rows.map(([label, value]) => (
@@ -723,10 +733,12 @@ function MilestoneCallout({
   showCompletedHint,
   showHalfwayHint,
   onCompareInChat,
+  exportRunName,
 }: {
   showCompletedHint: boolean;
   showHalfwayHint: boolean;
   onCompareInChat: () => Promise<void>;
+  exportRunName: string | null;
 }): ReactElement | null {
   const t = useT();
   if (!(showHalfwayHint || showCompletedHint)) {
@@ -738,7 +750,7 @@ function MilestoneCallout({
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           {!showCompletedHint && (
-            <p className="text-ui-10 font-medium uppercase tracking-[0.12em] text-muted-foreground">
+            <p className="text-ui-11 font-medium text-muted-foreground">
               {t("studio.training.milestone")}
             </p>
           )}
@@ -765,7 +777,12 @@ function MilestoneCallout({
             {t("studio.training.compareInChat")}
           </Button>
           <Button asChild={true} size="xs" variant="outline">
-            <Link to="/export">{t("studio.training.exportModel")}</Link>
+            <Link
+              to="/export"
+              search={exportRunName ? { run: exportRunName } : {}}
+            >
+              {t("studio.training.exportModel")}
+            </Link>
           </Button>
         </div>
       )}

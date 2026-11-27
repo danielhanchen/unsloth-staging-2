@@ -80,6 +80,13 @@ if not HAS_FLEX_ATTENTION:
             except torch.OutOfMemoryError:
                 raise
             except Exception as error:
+                # Checkpoint control flow (the non-reentrant recompute's early stop, a CheckpointError) and an
+                # OOM raised while compiling are not compile failures: latching eager would hide them.
+                if type(error).__name__ in (
+                    "_StopRecomputationError",
+                    "CheckpointError",
+                ) or isinstance(getattr(error, "inner_exception", None), torch.OutOfMemoryError):
+                    raise
                 # ROCm torch 2.11 inductor rejects this graph (inductor::_alloc_from_pool aliasing) on gfx1151.
                 logger.warning_once(
                     f"Unsloth: compiled Gemma2 softcapping attention failed on {key}, using eager: {error}"
@@ -204,8 +211,7 @@ def slow_inference_attention_softcapping(Q, K, V, causal_mask, self, bsz, kv_len
     K = K.reshape(bsz, n_heads, kv_len, head_dim)
     V = V.reshape(bsz, n_heads, kv_len, head_dim)
 
-    # Gemma 9b should use 256, not hidden_size // num_attention_heads (224); 27b uses the derived value,
-    # so default to the config. See google/gemma_pytorch commit 03e6575.
+    # Gemma 9b uses 256, not hidden_size // num_attention_heads, so read the config.
     s = self.config.query_pre_attn_scalar
     t = self.config.attn_logit_softcapping
 

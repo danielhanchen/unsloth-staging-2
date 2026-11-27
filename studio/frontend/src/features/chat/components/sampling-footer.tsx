@@ -182,14 +182,16 @@ export default function SamplingFooter({
             status.reasoning_always_on === true || state.reasoningEnabled,
           )
         : null;
-      state.setParams({
-        ...state.params,
+      const recommended = {
         ...recommendedSampling(
           status.inference as Record<string, unknown> | undefined,
           defaults,
         ),
         ...qwen,
-      });
+      };
+      state.setParams({ ...state.params, ...recommended });
+      // Otherwise the next model keeps this one's recommendation as if the user had picked it.
+      state.releasePresetEditedKeys(Object.keys(recommended));
     });
 
   const status = samplingSaveStatus(remember, saved, current);
@@ -224,12 +226,12 @@ export default function SamplingFooter({
         </p>
       </div>
       <div className="flex flex-wrap items-center gap-2">
-        {(remember || saved !== null) && (
+        {(remember ? !unchanged : saved !== null) && (
           <Button
             type="button"
             variant={remember ? "dark" : "outline"}
             size="sm"
-            disabled={!loaded || busy || (remember && unchanged)}
+            disabled={!loaded || busy}
             onClick={remember ? save : forget}
           >
             {remember ? "Save settings" : "Forget settings"}

@@ -12,8 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 from auth.authentication import authenticated_via_api_key, get_current_subject
-from core.scheduled_tasks.schedule import InvalidSchedule, Schedule
-from core.scheduled_tasks.scheduler import next_run_for
+from core.scheduled_tasks.schedule import InvalidSchedule, Schedule, next_run_after, parse_schedule
 from storage import scheduled_tasks_db as db
 
 router = APIRouter()
@@ -33,9 +32,17 @@ Prompt = Annotated[str, Field(max_length = 20_000), AfterValidator(_not_blank)]
 TimeZoneName = Annotated[str, Field(max_length = 64)]
 # Which finished runs get a toast and system notification; every run's chat still shows unread in Recents.
 Notify = Literal["all", "failures", "none"]
+TaskModel = Annotated[str, Field(max_length = 512), AfterValidator(_not_blank)]
+# lowest/highest are relative and resolved per run (local levels are known only once loaded); null = model default.
+ReasoningEffort = Literal[
+    "off", "lowest", "highest", "minimal", "low", "medium", "high", "xhigh", "max"
+]
 ProjectId = Annotated[str, Field(max_length = 128), AfterValidator(_not_blank)]
+McpServerId = Annotated[str, Field(max_length = 128), AfterValidator(_not_blank)]
+McpServerIds = Annotated[list[McpServerId], Field(max_length = 64)]
+ThreadId = Annotated[str, Field(max_length = 128), AfterValidator(_not_blank)]
 # Fields an update may set back to null, unlike the rest, where null means unchanged.
-_CLEARABLE = ("projectId",)
+_CLEARABLE = ("model", "reasoningEffort", "projectId", "threadId")
 
 
 class ScheduledTaskCreate(BaseModel):
@@ -48,8 +55,14 @@ class ScheduledTaskCreate(BaseModel):
     enabled: bool = True
     notify: Notify = "all"
     named: bool = True
+    model: Optional[TaskModel] = None
+    reasoningEffort: Optional[ReasoningEffort] = None
+    allowModelLoad: bool = False
     archiveSuccessful: bool = False
     projectId: Optional[ProjectId] = None
+    webSearch: bool = False
+    mcpServerIds: McpServerIds = Field(default_factory = list)
+    threadId: Optional[ThreadId] = None
 
 
 class ScheduledTaskUpdate(BaseModel):
@@ -62,8 +75,20 @@ class ScheduledTaskUpdate(BaseModel):
     enabled: Optional[bool] = None
     notify: Optional[Notify] = None
     named: Optional[bool] = None
+    model: Optional[TaskModel] = None
+    reasoningEffort: Optional[ReasoningEffort] = None
+    allowModelLoad: Optional[bool] = None
     archiveSuccessful: Optional[bool] = None
     projectId: Optional[ProjectId] = None
+    webSearch: Optional[bool] = None
+    mcpServerIds: Optional[McpServerIds] = None
+    threadId: Optional[ThreadId] = None
+
+
+class RunNowRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    loadModel: bool = False
 
 
 class ScheduledTaskRun(BaseModel):
@@ -77,7 +102,7 @@ class ScheduledTaskRun(BaseModel):
     finishedAt: Optional[int] = None
     threadId: Optional[str] = None
     model: Optional[str] = None
-    # no_model, timeout, cancelled, interrupted or empty.
+    # no_model, model_not_loaded, model_load_failed, connection_unavailable, timeout, cancelled, interrupted or empty.
     errorCode: Optional[str] = None
     error: Optional[str] = None
 
@@ -85,6 +110,7 @@ class ScheduledTaskRun(BaseModel):
 class FinishedScheduledTaskRun(ScheduledTaskRun):
     taskTitle: str
     taskNotify: Notify
+    taskModel: Optional[str] = None
 
 
 class ScheduledTask(BaseModel):
@@ -96,8 +122,14 @@ class ScheduledTask(BaseModel):
     enabled: bool
     notify: Notify
     named: bool
+    model: Optional[str] = None
+    reasoningEffort: Optional[ReasoningEffort] = None
+    allowModelLoad: bool = False
     archiveSuccessful: bool = False
     projectId: Optional[str] = None
+    webSearch: bool = False
+    mcpServerIds: McpServerIds = Field(default_factory = list)
+    threadId: Optional[str] = None
     status: Literal["active", "paused", "completed"]
     nextRunAt: Optional[int] = None
     createdAt: int
@@ -133,9 +165,21 @@ def _existing_project(project_id: Optional[str]) -> Optional[str]:
     return project_id
 
 
+def _existing_chat(thread_id: Optional[str]) -> Optional[str]:
+    from storage import studio_db
+
+    if thread_id is None:
+        return None
+    thread = studio_db.get_chat_thread(thread_id)
+    if thread is None or thread.get("pairId"):
+        raise HTTPException(status_code = 400, detail = "Chat not found")
+    return thread_id
+
+
 def _next_run(task: dict, now: int) -> Optional[int]:
     try:
-        following = next_run_for(task, now)
+        # Creation, a timing change, or resume starts a fresh hourly interval from now.
+        following = next_run_after(parse_schedule(task["schedule"]), task["timezone"], now)
     except InvalidSchedule as exc:
         raise HTTPException(status_code = 400, detail = str(exc)) from None
     if following is None and task["enabled"]:
@@ -144,7 +188,7 @@ def _next_run(task: dict, now: int) -> Optional[int]:
 
 
 def _require_ui_session(via_api_key: bool) -> None:
-    """Tasks run as the account: signed-in users only, never API keys."""
+    """Tasks run as the account and may load models or spend saved keys: signed-in users only, never API keys."""
     if via_api_key:
         raise HTTPException(
             status_code = 403,
@@ -182,8 +226,14 @@ def create_scheduled_task(
         "enabled": payload.enabled,
         "notify": payload.notify,
         "named": payload.named,
+        "model": payload.model,
+        "reasoningEffort": payload.reasoningEffort,
+        "allowModelLoad": payload.allowModelLoad,
         "archiveSuccessful": payload.archiveSuccessful,
         "projectId": _existing_project(payload.projectId),
+        "webSearch": payload.webSearch,
+        "mcpServerIds": list(dict.fromkeys(payload.mcpServerIds)),
+        "threadId": _existing_chat(payload.threadId),
         "createdAt": now,
         "updatedAt": now,
     }
@@ -202,7 +252,7 @@ def create_scheduled_task(
 # Declared ahead of /{task_id} so "runs" is never read as a task id.
 @router.get("/runs", response_model = ScheduledTaskActivity)
 def scheduled_task_activity(
-    since: Optional[int] = Query(default = None, ge = 0),
+    since: Optional[int] = Query(default = None, ge = 0, le = 2**63 - 1),
     current_subject: str = Depends(get_current_subject),
 ):
     """Runs finished since ``since`` (ms), for a client that notifies when results arrive."""
@@ -230,8 +280,12 @@ def update_scheduled_task(
     changes.update(
         {key: getattr(payload, key) for key in _CLEARABLE if key in payload.model_fields_set}
     )
+    if "mcpServerIds" in changes:
+        changes["mcpServerIds"] = list(dict.fromkeys(changes["mcpServerIds"]))
     if changes.get("projectId") is not None:
         _existing_project(changes["projectId"])
+    if changes.get("threadId") is not None:
+        _existing_chat(changes["threadId"])
     now = db.now_ms()
     # Only on schedule, time zone or enabled changes: a rename or resent value keeps an overdue run due.
     updated = db.update_task(task_id, changes, lambda task: _next_run(task, now))
@@ -261,13 +315,14 @@ def delete_scheduled_task(
 def run_scheduled_task_now(
     task_id: str,
     request: Request,
+    payload: Optional[RunNowRequest] = None,
     current_subject: str = Depends(get_current_subject),
     via_api_key: bool = Depends(authenticated_via_api_key),
 ):
     """Queue a run outside the schedule; the next scheduled run is unaffected."""
     _require_ui_session(via_api_key)
     try:
-        run = db.request_run(task_id)
+        run = db.request_run(task_id, allow_model_load = payload is not None and payload.loadModel)
     except db.TaskRunActive:
         raise HTTPException(status_code = 409, detail = "This task is already running.") from None
     if run is None:
