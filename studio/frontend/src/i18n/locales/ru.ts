@@ -5106,6 +5106,9 @@ export const ru = {
       saveHistoryDescription: "Хранится только в этом браузере.",
       showPrompt: "Показать промпт",
       showPromptDescription: "Посмотреть точные инструкции, отправленные модели.",
+      keepNames: "Сохранять исходные имена",
+      keepNamesDescription:
+        "Показывать исходное написание после каждого имени, например डेविन वे (Devin Way).",
     },
     history: {
       notSaved: "Не сохранено в историю: хранилище браузера заполнено.",
