@@ -247,6 +247,7 @@ import {
   getStoredChatThread,
   getStoredChatThreadReadResult,
   isExpectedBackgroundChatStorageError,
+  isThreadIncognito,
   listStoredChatMessages,
   readStoredChatMessages,
   listStoredChatThreads,
@@ -2462,6 +2463,7 @@ async function waitForRunStartHistoryAppend(
 
 function createPersistedRunAdapter(
   adapter: ChatModelAdapter,
+  pairId?: string,
 ): ChatModelAdapter {
   return {
     ...adapter,
@@ -2531,7 +2533,15 @@ function createPersistedRunAdapter(
         yield await result;
       }
       if (!options.abortSignal?.aborted) {
-        notifyReplyFinished(adoptedThreadId ?? options.unstable_threadId);
+        const threadId = adoptedThreadId ?? options.unstable_threadId;
+        // Temporary chats have no stored row to open, so their click only focuses.
+        notifyReplyFinished(
+          pairId
+            ? { compare: pairId }
+            : threadId && !isThreadIncognito(threadId)
+              ? { thread: threadId }
+              : null,
+        );
       }
     },
   };
@@ -3255,6 +3265,7 @@ function useRuntimeHook(
     () =>
       createPersistedRunAdapter(
         createOpenAIStreamAdapter({ modelType, pairId }),
+        pairId,
       ),
     [modelType, pairId],
   );
