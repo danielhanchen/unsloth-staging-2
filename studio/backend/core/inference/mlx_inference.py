@@ -5037,6 +5037,59 @@ def _vlm_generate_kwargs(inputs):
     }
 
 
+@contextmanager
+def _spliced_columns(model):
+    """Yields ``[n]``: the columns the widest prompt embedding filled past its ids. A model that
+    splices an image's features in place of its one placeholder id (FastVLM) fills more positions
+    than mlx-vlm's id-counted ``prompt_tokens`` names."""
+    spliced, widest = [0], [-1]
+    embed = getattr(model, "get_input_embeddings", None)
+    if embed is None:
+        yield spliced
+        return
+    own = vars(model).get("get_input_embeddings")
+
+    def counted(*args, **kwargs):
+        out = embed(*args, **kwargs)
+        ids = kwargs.get("input_ids", args[0] if args else None)
+        shape = getattr(ids, "shape", None)
+        columns = getattr(getattr(out, "inputs_embeds", None), "shape", None)
+        if shape and columns and len(columns) > 1 and shape[-1] > widest[0]:
+            widest[0], spliced[0] = shape[-1], int(columns[1]) - int(shape[-1])
+        return out
+
+    model.get_input_embeddings = counted
+    try:
+        yield spliced
+    finally:
+        if own is None:
+            del model.get_input_embeddings
+        else:
+            model.get_input_embeddings = own
+
+
+def _embedded_columns(model, inputs):
+    """Columns ``get_input_embeddings`` fills for prepared inputs, read off the unevaluated graph;
+    None if unbuildable."""
+    rest = {
+        k: v for k, v in inputs.items() if k not in ("input_ids", "pixel_values", "attention_mask")
+    }
+    try:
+        out = model.get_input_embeddings(
+            inputs["input_ids"],
+            inputs.get("pixel_values"),
+            mask = inputs.get("attention_mask"),
+            **rest,
+        )
+        shape = getattr(getattr(out, "inputs_embeds", None), "shape", None)
+    except Exception as exc:
+        if is_metal_queue_dead(exc):
+            raise
+        logger.debug("MLX prompt embedding width unavailable: %s", exc)
+        return None
+    return int(shape[1]) if shape and len(shape) > 1 else None
+
+
 class _VLMMediaBlock:
     """A prompt's rows through its last vision token, prefilled by Studio: models whose vision
     tokens attend to each other prefill in one forward that lands off the grid, and this is that
@@ -6026,6 +6079,7 @@ class MLXInferenceBackend:
         self._reasoning_budget = -1
         self._reasoning_budget_message = ""
         self._multi_image_marker = None
+        self._media_splices = False
         self._config = {}
         self._distributed_group = None
         self._distributed_rank = 0
@@ -6454,6 +6508,8 @@ class MLXInferenceBackend:
                 else self._count_prompt_tokens(prompt, images, audio, videos)
             )
         except Exception as exc:
+            if is_metal_queue_dead(exc):
+                raise
             logger.debug("MLX prompt count failed: %s", exc)
             return None
         window = self._served_context
@@ -6475,8 +6531,16 @@ class MLXInferenceBackend:
         if prompt_tokens is None and isinstance(prompt, list):
             prompt_tokens = prompt
         budget = getattr(self, "_kv_context_budget", None)
+        # Without a budget, media is prepared only where its placeholder count misses spliced columns.
+        splices = bool(images) and getattr(self, "_media_splices", False)
+        if prompt_tokens is None and (budget or splices):
+            try:
+                prompt_tokens = range(self._count_prompt_tokens(prompt, images, audio, videos))
+            except Exception as exc:
+                if is_metal_queue_dead(exc):
+                    raise
+                logger.debug("MLX prompt count for the context budget failed: %s", exc)
         if not budget:
-            # No budget: size from the placeholder count as before, never preparing the media.
             if max_new_tokens is None:
                 max_new_tokens = self._unset_generation_budget(prompt, prompt_tokens)
                 if cap is not None:
@@ -6487,11 +6551,6 @@ class MLXInferenceBackend:
         # Max Tokens == window is the UI's "no cap"; admitting it as-is would refuse every prompt.
         if max_new_tokens is not None and int(max_new_tokens) == int(budget):
             max_new_tokens = None
-        if prompt_tokens is None:
-            try:
-                prompt_tokens = range(self._count_prompt_tokens(prompt, images, audio, videos))
-            except Exception as exc:
-                logger.debug("MLX prompt count for the context budget failed: %s", exc)
         if max_new_tokens is None:
             max_new_tokens = self._unset_generation_budget(prompt, prompt_tokens)
             if cap is not None:
@@ -6634,6 +6693,8 @@ class MLXInferenceBackend:
                 else self._count_prompt_tokens(prompt, images, audio, videos)
             )
         except Exception as exc:
+            if is_metal_queue_dead(exc):
+                raise
             logger.debug("MLX prompt count for the context budget failed: %s", exc)
             return
         needed = prompt_n + max(0, int(max_new_tokens or 0))
@@ -6672,7 +6733,8 @@ class MLXInferenceBackend:
         audio = None,
         videos = None,
     ):
-        """Prompt length as the processor expands media (as mlx-vlm's server does), else None."""
+        """Prompt length as the processor expands media (as mlx-vlm's server does), or as the model
+        splices images, else None."""
         if not (images or audio or videos):
             return None
         try:
@@ -6701,10 +6763,35 @@ class MLXInferenceBackend:
                 **kwargs,
             )
             ids = inputs["input_ids"]
-            return int(getattr(ids, "size", 0)) or len(ids)
+            counted = int(getattr(ids, "size", 0)) or len(ids)
         except Exception as exc:
+            if is_metal_queue_dead(exc):
+                raise
             logger.debug("MLX media prompt count failed: %s", exc)
             return None
+        splices = getattr(self, "_media_splices", False)
+        if not images or splices is False:
+            return counted
+        columns = _embedded_columns(self._model, inputs)
+        if splices is None:
+            self._media_splices = bool(columns) and columns > counted
+        # FastVLM truncates its embedding at tokenizer_model_max_length, below the ids.
+        return columns or counted
+
+    def _measure_media_splice(self):
+        """Whether this model fills an image's features in place of one placeholder id (FastVLM), so
+        its prompts are wider than the processor's ids; measured once per load on a blank image."""
+        from PIL import Image
+
+        self._media_splices = None
+        try:
+            blank = Image.new("RGB", (224, 224), "white")
+            self.count_chat_tokens([{"role": "user", "content": "."}], images = [blank])
+        except Exception as exc:
+            if is_metal_queue_dead(exc):
+                raise
+            logger.debug("MLX media splice probe failed: %s", exc)
+        return bool(self._media_splices)
 
     def _count_prompt_tokens(
         self,
@@ -7446,6 +7533,9 @@ class MLXInferenceBackend:
                     mlx_ane_prefill = self._ane_prefill["active"],
                     mlx_ane_prefill_reason = self._ane_prefill["reason"],
                 )
+        self._media_splices = bool(use_vlm and is_vision and not is_distributed) and (
+            self._measure_media_splice()
+        )
         logger.info("Model %s loaded successfully", model_name)
         return True
 
@@ -9273,6 +9363,7 @@ class MLXInferenceBackend:
                 generation_scope.enter_context(
                     self._generation_scopes("vision", *(() if draft is None else ("speculative",)))
                 )
+                spliced = generation_scope.enter_context(_spliced_columns(self._model))
                 final_response = None
                 clip_paths = []
                 try:
@@ -9417,10 +9508,12 @@ class MLXInferenceBackend:
                         stop_ids = _mlx_stop_token_ids(tokenizer, self._model)
                         # mlx-vlm rates the full prompt against its prefill, which omits rows the session produced first.
                         prompt_n = int(getattr(final_response, "prompt_tokens", 0) or 0)
-                        prefilled_n = max(prompt_n - cached_n, 0)
                         prompt_tps = float(getattr(final_response, "prompt_tps", 0.0) or 0.0)
-                        if prompt_tps and (cached_n or produced_s):
-                            prompt_tps = prefilled_n / (prompt_n / prompt_tps + produced_s)
+                        prompt_s = prompt_n / prompt_tps if prompt_tps else 0.0
+                        prompt_n += spliced[0]
+                        prefilled_n = max(prompt_n - cached_n, 0)
+                        if prompt_tps and (cached_n or produced_s or spliced[0]):
+                            prompt_tps = prefilled_n / (prompt_s + produced_s)
                         self.last_generation_stats = _build_generation_stats(
                             prefilled_n,
                             prompt_tps,
