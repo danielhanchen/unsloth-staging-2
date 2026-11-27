@@ -45505,10 +45505,20 @@ async def _mlx_count_chat_tokens(
     if not active:
         return None
     entry = getattr(backend, "models", {}).get(active) or {}
-    # Audio skips the chat render; vision does not, as it serves text turns through the same render.
-    managed = entry.get("engine") in ("vllm", "sglang")
-    if not (entry.get("is_mlx") or managed) or entry.get("is_audio"):
+    if not entry:
         return None
+    # A resident model is named, never reported as unloaded; vision counts, speech renders no chat.
+    if entry.get("is_audio"):
+        raise HTTPException(
+            status_code = 503,
+            detail = "Token counting is not available for speech or transcription models.",
+        )
+    managed = entry.get("engine") in ("vllm", "sglang")
+    if not (entry.get("is_mlx") or managed):
+        raise HTTPException(
+            status_code = 503,
+            detail = "Token counting is not available on the transformers backend.",
+        )
     if entry.get("engine") == "sglang":
         raise HTTPException(
             status_code = 503,
@@ -45786,6 +45796,9 @@ async def _mlx_count_chat_tokens(
         instructions = system_prompt if include_system else ""
         if instructions and _tools_to_use and not tools:
             instructions = _without_tool_nudge(instructions, _nudge)
+        # The completion refuses instructions alone, so price the next send minus the user's text.
+        if not any(m.get("role") not in ("system", "developer") for m in count_messages):
+            count_messages = [*count_messages, {"role": "user", "content": ""}]
         count, _counted = backend.count_chat_tokens(
             count_messages,
             instructions or "",
