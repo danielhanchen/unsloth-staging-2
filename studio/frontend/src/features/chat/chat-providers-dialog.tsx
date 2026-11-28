@@ -501,7 +501,7 @@ export function ChatProvidersSettings({
   const configuredModelsRef = useRef(autoCompactModels);
   configuredModelsRef.current = autoCompactModels;
   const endpointDraftRef = useRef("");
-  endpointDraftRef.current = `${baseUrlDraft}\n${extraHeadersDraft}`;
+  endpointDraftRef.current = `${baseUrlDraft}\n${extraHeadersDraft}\n${apiKey}\n${clearApiKeyRequested}`;
   const autoCompactModel = autoCompactModels.includes(autoCompactScope)
     ? autoCompactScope
     : null;
@@ -1035,7 +1035,7 @@ export function ChatProvidersSettings({
       return;
     }
     const request = formCheckRequestRef.current;
-    const endpoint = `${baseUrlDraft}\n${extraHeadersDraft}`;
+    const endpoint = `${baseUrlDraft}\n${extraHeadersDraft}\n${apiKey}\n${clearApiKeyRequested}`;
     setEffortDetecting(true);
     try {
       const capabilities = await listProviderModelCapabilities({
