@@ -725,6 +725,15 @@ def _worker(rank, world, tmp, case, kwargs):
 
     import torch.distributed as dist
 
+    _diag = None
+    if os.environ.get("G184_STACKS"):
+        import faulthandler
+        os.makedirs(os.environ["G184_STACKS"], exist_ok = True)
+        tag = str(kwargs.get("repo") or kwargs.get("config", {}).get("model_type", "")).replace("/", "_")
+        _diag = open(os.path.join(os.environ["G184_STACKS"], f"{case}_{tag}_{world}_r{rank}_{os.getpid()}.txt"), "w")
+        _diag.write(f"start {time.time():.1f} case={case} kw={sorted(kwargs)} zyg={os.environ.get('_UNSLOTH_RANK_ZYGOTE_SPEC','-')[:40]}\n")
+        _diag.flush()
+        faulthandler.dump_traceback_later(90, repeat = True, file = _diag)
     torch.set_num_threads(2)
     dist.init_process_group(
         "gloo",
@@ -738,8 +747,14 @@ def _worker(rank, world, tmp, case, kwargs):
     except BaseException as exc:  # pytest's Skipped / exit too: a rank must report, not vanish
         import traceback
         res = {"error": f"{type(exc).__name__}: {exc}"[:600] + traceback.format_exc()[-4000:]}
+    if _diag:
+        _diag.write(f"case done {time.time():.1f} error={'error' in res if isinstance(res, dict) else '-'}\n{str(res.get('error',''))[:3000] if isinstance(res, dict) else ''}\n")
+        _diag.flush()
     torch.save(res, os.path.join(tmp, f"result_{rank}.pt"))
     dist.destroy_process_group()
+    if _diag:
+        _diag.write(f"destroyed {time.time():.1f}\n")
+        _diag.flush()
 
 
 def _spawn(
@@ -757,10 +772,14 @@ def _spawn(
         deadline = time.monotonic() + 600
         while any(p.is_alive() for p in procs) and time.monotonic() < deadline:
             time.sleep(0.2)
+        alive = [p.is_alive() for p in procs]
         for p in procs:
             if p.is_alive():
                 p.terminate()
             p.join(30)
+        if os.environ.get("G184_STACKS"):
+            with open(os.path.join(os.environ["G184_STACKS"], "spawn_log.txt"), "a") as f:
+                f.write(f"{time.time():.1f} {case} {sorted(kwargs)} world={world} took={time.monotonic() - deadline + 600:.1f} alive_at_deadline={alive} exitcodes={[p.exitcode for p in procs]} results={[os.path.exists(os.path.join(tmp, f'result_{r}.pt')) for r in range(world)]}\n")
         out = []
         for r in range(world):
             path = os.path.join(tmp, f"result_{r}.pt")
