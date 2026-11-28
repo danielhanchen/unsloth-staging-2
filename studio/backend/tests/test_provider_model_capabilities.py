@@ -634,7 +634,6 @@ def test_custom_route_reads_efforts_from_the_served_template(
         )
     )
     providers_route._model_capability_cache.clear()
-    # The /models entry already reported its efforts, so only the bare one is probed.
     assert _TemplateClient.probed == ["gpt-oss-20b"]
     by_id = {entry["id"]: entry for entry in found}
     assert by_id["openai/gpt-5.5"]["reasoning"]["supported_efforts"][-1] == "xhigh"
@@ -730,7 +729,6 @@ def test_custom_capabilities_are_reread_on_every_detection(monkeypatch):
         )
 
     assert detect()[0]["reasoning"]["supported_efforts"] == ["low", "medium", "high"]
-    # The server swapped to a model with no effort levels behind the same URL.
     _TemplateClient.templates = {"served": "{% if enable_thinking %}{% endif %}"}
     assert detect() == []
     assert _TemplateClient.calls == 2

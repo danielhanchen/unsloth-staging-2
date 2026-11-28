@@ -75,7 +75,6 @@ export function detectedCustomEffortLevels(
   const reported = capabilities.filter(
     (entry) => (entry.reasoning?.supported_efforts?.length ?? 0) > 0,
   );
-  // The ladder applies to every configured model, so one that did not report leaves it unchanged.
   const pool =
     selectedModelIds.length > 0
       ? selectedModelIds.map((id) => reported.find((entry) => entry.id === id))

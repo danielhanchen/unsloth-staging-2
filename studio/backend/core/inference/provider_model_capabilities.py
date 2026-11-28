@@ -75,7 +75,6 @@ def provider_model_capabilities(
     if provider_type not in MODEL_CAPABILITY_PROVIDERS:
         return []
     if provider_type == "custom":
-        # Only gateways answering in OpenRouter's /models shape say anything per model.
         models = [m for m in models if isinstance(m, dict) and isinstance(m.get("reasoning"), dict)]
     mapped = (openrouter_model_capabilities(m) for m in models if isinstance(m, dict))
     return [entry for entry in mapped if entry is not None]

@@ -1480,8 +1480,7 @@ async def _custom_template_capabilities(client, models: list, known: list) -> li
     found = []
     for model_id, props in zip(ids, answers):
         template = (props or {}).get("chat_template")
-        # A server that ignores ?model= describes only its resident model, so with several listed the
-        # answer must name this one.
+        # A server ignoring ?model= describes its resident model, so with several listed it must name this one.
         if (
             not isinstance(template, str)
             or not template
@@ -1489,7 +1488,6 @@ async def _custom_template_capabilities(client, models: list, known: list) -> li
         ):
             continue
         flags = detect_reasoning_flags(template, model_id, log_level = "debug")
-        # "none" is the Off row, never a rung.
         levels = [level for level in flags["reasoning_effort_levels"] if level != "none"]
         if levels:
             found.append(
